@@ -2,6 +2,7 @@ import streamlit as st
 import ccxt
 import pandas as pd
 import time
+import requests
 from concurrent.futures import ThreadPoolExecutor
 from streamlit_autorefresh import st_autorefresh
 
@@ -9,11 +10,34 @@ st.set_page_config(page_title="AI Crypto Trading Terminal", layout="wide")
 
 st.title("AI Crypto Trading Terminal")
 
-# refresh every minute
 st_autorefresh(interval=60000, key="refresh")
 
 # -------------------------
-# OKX EXCHANGE CONNECTION
+# TELEGRAM CONFIG
+# -------------------------
+
+TELEGRAM_TOKEN = st.secrets["8576671444:AAE_JkxU5BtlrcXqTC60mRFz7dZxKamQ4Zw"]
+TELEGRAM_CHAT_ID = st.secrets["1686201325"]
+
+def send_telegram(message):
+
+    try:
+
+        url = f"https://api.telegram.org/bot{8576671444:AAE_JkxU5BtlrcXqTC60mRFz7dZxKamQ4Zw}/sendMessage"
+
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message
+        }
+
+        requests.post(url, data=payload)
+
+    except:
+        pass
+
+
+# -------------------------
+# CONNECT OKX
 # -------------------------
 
 exchange = ccxt.okx({
@@ -33,7 +57,7 @@ def load_markets():
         try:
             return exchange.load_markets()
 
-        except Exception:
+        except:
             time.sleep(2)
 
     return None
@@ -41,12 +65,24 @@ def load_markets():
 
 markets = load_markets()
 
-if not markets:
-    st.error("Unable to connect to OKX API. Please refresh.")
+if markets is None:
+
+    st.error("Unable to connect to OKX API")
+
     st.stop()
 
-# OKX symbols
-symbols = [s for s in markets.keys() if "/USDT" in s][:200]
+
+# -------------------------
+# FILTER SPOT MARKETS
+# -------------------------
+
+symbols = [
+
+    s for s in markets
+    if "/USDT" in s and markets[s]["type"] == "spot"
+
+][:200]
+
 
 # -------------------------
 # FETCH OHLCV
@@ -55,7 +91,15 @@ symbols = [s for s in markets.keys() if "/USDT" in s][:200]
 @st.cache_data(ttl=120)
 def fetch_ohlcv(symbol):
 
-    return exchange.fetch_ohlcv(symbol, "1h", limit=100)
+    for _ in range(3):
+
+        try:
+            return exchange.fetch_ohlcv(symbol, "1h", limit=100)
+
+        except:
+            time.sleep(1)
+
+    return None
 
 
 # -------------------------
@@ -68,12 +112,17 @@ def analyze_symbol(symbol):
 
         ohlcv = fetch_ohlcv(symbol)
 
+        if ohlcv is None:
+            return None
+
         df = pd.DataFrame(
             ohlcv,
-            columns=["t","open","high","low","close","volume"]
+            columns=["timestamp","open","high","low","close","volume"]
         )
 
         price = df["close"].iloc[-1]
+
+        # RSI
 
         delta = df["close"].diff()
 
@@ -81,9 +130,12 @@ def analyze_symbol(symbol):
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
 
         rs = gain / loss
+
         rsi = 100 - (100 / (1 + rs))
 
         latest_rsi = rsi.iloc[-1]
+
+        # Trend
 
         ema20 = df["close"].ewm(span=20).mean()
         ema50 = df["close"].ewm(span=50).mean()
@@ -92,11 +144,17 @@ def analyze_symbol(symbol):
 
         trend_score = 1 if bullish else 0
 
+        # Volume Surge
+
         avg_volume = df["volume"].tail(20).mean()
         current_volume = df["volume"].iloc[-1]
 
-        volume_ratio = current_volume / avg_volume
-        volume_surge = round(volume_ratio * 100, 2)
+        if avg_volume == 0:
+            volume_surge = 0
+        else:
+            volume_surge = round((current_volume / avg_volume) * 100, 2)
+
+        # Momentum Score
 
         momentum_score = 0
 
@@ -124,7 +182,28 @@ def analyze_symbol(symbol):
 
         volatility = ((df["high"] - df["low"]) / df["close"]).mean() * 100
 
+        # TELEGRAM ALERT
+
+        if signal == "STRONG BUY":
+
+            alert = f"""
+🚨 AI TRADE ALERT
+
+Symbol: {symbol}
+Price: {round(price,4)}
+
+Volume Surge: {volume_surge}%
+Momentum Score: {momentum_score}
+
+Radar Score: {round(radar_score,2)}
+
+Signal: {signal}
+"""
+
+            send_telegram(alert)
+
         return {
+
             "Symbol": symbol,
             "Price": round(price,4),
             "Volume Surge %": volume_surge,
@@ -132,6 +211,7 @@ def analyze_symbol(symbol):
             "Radar Score": round(radar_score,2),
             "Signal": signal,
             "Volatility %": round(volatility,2)
+
         }
 
     except:
@@ -139,7 +219,7 @@ def analyze_symbol(symbol):
 
 
 # -------------------------
-# PARALLEL SCANNER
+# PARALLEL SCANNING
 # -------------------------
 
 results = []
