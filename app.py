@@ -10,7 +10,7 @@ st.set_page_config(page_title="AI Crypto Trading Terminal", layout="wide")
 
 st.title("AI Crypto Trading Terminal")
 
-# Refresh every minute
+# Auto refresh every minute
 st_autorefresh(interval=60000, key="refresh")
 
 # -----------------------------
@@ -39,13 +39,14 @@ def send_telegram(message):
 
 
 # -----------------------------
-# CONNECT TO OKX
+# CONNECT OKX
 # -----------------------------
 
 exchange = ccxt.okx({
     "enableRateLimit": True,
     "timeout": 30000
 })
+
 
 # -----------------------------
 # LOAD MARKETS
@@ -68,13 +69,12 @@ def load_markets():
 markets = load_markets()
 
 if markets is None:
-
     st.error("Unable to connect to OKX API")
-
     st.stop()
 
+
 # -----------------------------
-# FILTER SPOT MARKETS
+# FILTER SPOT USDT MARKETS
 # -----------------------------
 
 symbols = [
@@ -84,7 +84,7 @@ symbols = [
 
 
 # -----------------------------
-# FETCH OHLCV
+# FETCH MARKET DATA
 # -----------------------------
 
 @st.cache_data(ttl=120)
@@ -116,7 +116,7 @@ def analyze_symbol(symbol):
 
         df = pd.DataFrame(
             ohlcv,
-            columns=["timestamp", "open", "high", "low", "close", "volume"]
+            columns=["timestamp","open","high","low","close","volume"]
         )
 
         price = df["close"].iloc[-1]
@@ -132,13 +132,13 @@ def analyze_symbol(symbol):
 
         latest_rsi = rsi.iloc[-1]
 
-        # Trend
+        # EMA Trend
         ema20 = df["close"].ewm(span=20).mean()
         ema50 = df["close"].ewm(span=50).mean()
 
         bullish = ema20.iloc[-1] > ema50.iloc[-1]
 
-        trend_score = 1 if bullish else 0
+        trend_score = 25 if bullish else 0
 
         # Volume surge
         avg_volume = df["volume"].tail(20).mean()
@@ -149,63 +149,54 @@ def analyze_symbol(symbol):
         else:
             volume_surge = round((current_volume / avg_volume) * 100, 2)
 
-        # Momentum
-        momentum_score = 0
+        momentum = 0
 
         if volume_surge > 150:
-            momentum_score += 40
+            momentum += 40
 
         if latest_rsi > 55:
-            momentum_score += 30
-
-        score = trend_score * 25
+            momentum += 30
 
         radar_score = (
-            score * 0.4 +
-            momentum_score * 0.4 +
+            trend_score * 0.4 +
+            momentum * 0.4 +
             min(volume_surge, 300) * 0.2
         )
 
         signal = "WATCH"
 
-        if radar_score > 150:
+        if radar_score > 60:
             signal = "BUY"
 
-        if radar_score > 220:
+        if radar_score > 80:
             signal = "STRONG BUY"
 
-        volatility = ((df["high"] - df["low"]) / df["close"]).mean() * 100
-
-        # -----------------------------
         # TELEGRAM ALERT
-        # -----------------------------
-
         if signal == "STRONG BUY":
 
-            alert = f"""
+            message = f"""
 🚨 AI TRADE ALERT
 
 Symbol: {symbol}
 Price: {round(price,4)}
 
 Volume Surge: {volume_surge}%
-Momentum Score: {momentum_score}
+Momentum: {momentum}
 
 Radar Score: {round(radar_score,2)}
 
 Signal: {signal}
 """
 
-            send_telegram(alert)
+            send_telegram(message)
 
         return {
             "Symbol": symbol,
             "Price": round(price,4),
             "Volume Surge %": volume_surge,
-            "Momentum": momentum_score,
+            "Momentum": momentum,
             "Radar Score": round(radar_score,2),
-            "Signal": signal,
-            "Volatility %": round(volatility,2)
+            "Signal": signal
         }
 
     except:
@@ -223,49 +214,24 @@ with ThreadPoolExecutor(max_workers=20) as executor:
     data = list(executor.map(analyze_symbol, symbols))
 
 for d in data:
-
     if d:
         results.append(d)
 
 df = pd.DataFrame(results)
 
 # -----------------------------
-# DASHBOARD
+# AI TRADE SIGNALS
 # -----------------------------
 
 st.subheader("AI Trade Signals")
 
-signals = df.sort_values(by="Radar Score", ascending=False).head(10)
+signals = df.sort_values(
+    by="Radar Score",
+    ascending=False
+).head(15)
 
 st.dataframe(signals)
 
-st.subheader("Momentum Radar")
-
-momentum = df.sort_values(by="Momentum", ascending=False).head(10)
-
-st.dataframe(momentum)
-
-st.subheader("Volume Surge")
-
-volume = df.sort_values(by="Volume Surge %", ascending=False).head(10)
-
-st.dataframe(volume)
-
-st.subheader("Volatility Radar")
-
-volatility = df.sort_values(by="Volatility %", ascending=False).head(10)
-
-st.dataframe(volatility)
-
-# -----------------------------
-# MARKET HEATMAP
-# -----------------------------
-
-st.subheader("Market Heatmap")
-
-heat = df[["Symbol", "Radar Score"]].set_index("Symbol")
-
-st.bar_chart(heat)
 
 # -----------------------------
 # TRADINGVIEW CHART
@@ -273,9 +239,12 @@ st.bar_chart(heat)
 
 st.subheader("Market Chart")
 
-selected = st.selectbox("Select Market", df["Symbol"])
+selected_symbol = st.selectbox(
+    "Select Market",
+    df["Symbol"]
+)
 
-tv_symbol = "OKX:" + selected.replace("/", "")
+tv_symbol = "OKX:" + selected_symbol.replace("/","")
 
 chart = f"""
 <div class="tradingview-widget-container">
