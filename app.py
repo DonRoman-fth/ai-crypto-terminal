@@ -2,53 +2,86 @@ import streamlit as st
 import ccxt
 import pandas as pd
 import requests
+import time
 from concurrent.futures import ThreadPoolExecutor
 from streamlit_autorefresh import st_autorefresh
 
+st.set_page_config(page_title="AI Crypto Trading Terminal", layout="wide")
+
 st.title("AI Crypto Trading Terminal")
 
-st_autorefresh(interval=30000,key="scanner_refresh")
-
-exchange = ccxt.binance()
+st_autorefresh(interval=60000, key="scanner_refresh")
 
 # -------------------------
-# TELEGRAM CONFIG
+# TELEGRAM ALERTS
 # -------------------------
 
-TELEGRAM_TOKEN = "PUT_YOUR_BOT_TOKEN"
-TELEGRAM_CHAT_ID = "PUT_YOUR_CHAT_ID"
+TELEGRAM_TOKEN = ""
+TELEGRAM_CHAT_ID = ""
 
-def send_telegram(message):
-    if TELEGRAM_TOKEN != "PUT_YOUR_BOT_TOKEN":
-        url=f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url,data={"chat_id":TELEGRAM_CHAT_ID,"text":message})
+def send_telegram(msg):
+    if TELEGRAM_TOKEN:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+
 
 # -------------------------
-# CACHE MARKETS
+# EXCHANGE SETUP
+# -------------------------
+
+exchange = ccxt.binance({
+    "enableRateLimit": True,
+    "timeout": 30000,
+    "options": {"adjustForTimeDifference": True}
+})
+
+
+# -------------------------
+# LOAD MARKETS SAFELY
 # -------------------------
 
 @st.cache_data(ttl=3600)
 def load_markets():
-    return exchange.load_markets()
+
+    for _ in range(3):
+
+        try:
+            return exchange.load_markets()
+
+        except Exception:
+
+            time.sleep(3)
+
+    return {}
 
 markets = load_markets()
 
-symbols=[s for s in markets if "/USDT" in s][:200]
+if not markets:
+    st.error("Unable to connect to exchange API. Please refresh.")
+    st.stop()
+
+
+symbols = [s for s in markets.keys() if "/USDT" in s][:200]
+
 
 # -------------------------
-# CACHE DATA
+# DATA FETCHING
 # -------------------------
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=120)
 def fetch_ohlcv(symbol):
-    return exchange.fetch_ohlcv(symbol,"1h")
 
-@st.cache_data(ttl=60)
+    return exchange.fetch_ohlcv(symbol, "1h", limit=100)
+
+
+@st.cache_data(ttl=120)
 def fetch_orderbook(symbol):
+
     return exchange.fetch_order_book(symbol)
 
+
 # -------------------------
-# SCANNER FUNCTION
+# ANALYSIS ENGINE
 # -------------------------
 
 def analyze_symbol(symbol):
@@ -64,163 +97,189 @@ def analyze_symbol(symbol):
 
         price = df["close"].iloc[-1]
 
-        delta=df["close"].diff()
+        delta = df["close"].diff()
 
-        gain=(delta.where(delta>0,0)).rolling(14).mean()
-        loss=(-delta.where(delta<0,0)).rolling(14).mean()
+        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
 
-        rs=gain/loss
-        rsi=100-(100/(1+rs))
+        rs = gain / loss
 
-        latest_rsi=rsi.iloc[-1]
+        rsi = 100 - (100 / (1 + rs))
 
-        ema20=df["close"].ewm(span=20).mean()
-        ema50=df["close"].ewm(span=50).mean()
+        latest_rsi = rsi.iloc[-1]
 
-        bullish=ema20.iloc[-1]>ema50.iloc[-1]
+        ema20 = df["close"].ewm(span=20).mean()
+        ema50 = df["close"].ewm(span=50).mean()
 
-        trend_score=1 if bullish else 0
+        bullish = ema20.iloc[-1] > ema50.iloc[-1]
 
-        recent_high=df["high"].tail(20).max()
+        trend_score = 1 if bullish else 0
 
-        avg_volume=df["volume"].tail(20).mean()
-        current_volume=df["volume"].iloc[-1]
+        recent_high = df["high"].tail(20).max()
 
-        volume_ratio=current_volume/avg_volume
-        volume_surge=round(volume_ratio*100,2)
+        avg_volume = df["volume"].tail(20).mean()
 
-        volume_spike=current_volume>avg_volume*1.5
-        near_resistance=price>recent_high*0.95
+        current_volume = df["volume"].iloc[-1]
 
-        momentum_score=0
+        volume_ratio = current_volume / avg_volume
+
+        volume_surge = round(volume_ratio * 100, 2)
+
+        volume_spike = current_volume > avg_volume * 1.5
+
+        near_resistance = price > recent_high * 0.95
+
+        momentum_score = 0
 
         if volume_spike:
-            momentum_score+=40
+            momentum_score += 40
 
         if near_resistance:
-            momentum_score+=30
+            momentum_score += 30
 
-        if latest_rsi>55:
-            momentum_score+=30
+        if latest_rsi > 55:
+            momentum_score += 30
 
-        score=trend_score*25
+        score = trend_score * 25
 
-        radar_score=(score*0.4+momentum_score*0.4+min(volume_surge,300)*0.2)
+        radar_score = (
+            score * 0.4 +
+            momentum_score * 0.4 +
+            min(volume_surge, 300) * 0.2
+        )
 
-        signal_score=score+momentum_score+min(volume_surge,200)
+        signal_score = score + momentum_score + min(volume_surge, 200)
 
-        signal="WATCH"
+        signal = "WATCH"
 
-        if signal_score>250:
-            signal="STRONG BUY"
-        elif signal_score>180:
-            signal="BUY"
-        elif signal_score<80:
-            signal="SELL"
+        if signal_score > 250:
+            signal = "STRONG BUY"
 
-        # Volatility
+        elif signal_score > 180:
+            signal = "BUY"
 
-        volatility=((df["high"]-df["low"])/df["close"]).mean()*100
+        elif signal_score < 80:
+            signal = "SELL"
 
-        # Orderbook imbalance
+        volatility = ((df["high"] - df["low"]) / df["close"]).mean() * 100
 
-        orderbook=fetch_orderbook(symbol)
+        orderbook = fetch_orderbook(symbol)
 
-        bid_vol=sum([b[1] for b in orderbook["bids"][:10]])
-        ask_vol=sum([a[1] for a in orderbook["asks"][:10]])
+        bid_vol = sum([b[1] for b in orderbook["bids"][:10]])
 
-        imbalance=round((bid_vol/(ask_vol+1))*100,2)
+        ask_vol = sum([a[1] for a in orderbook["asks"][:10]])
 
-        whale="NORMAL"
+        imbalance = round((bid_vol / (ask_vol + 1)) * 100, 2)
 
-        if volume_surge>250:
-            whale="WHALE BUYING"
+        whale = "NORMAL"
 
-        breakout="NO"
+        if volume_surge > 250:
+            whale = "WHALE BUYING"
+
+        breakout = "NO"
 
         if near_resistance and volume_spike:
-            breakout="BREAKOUT"
+            breakout = "BREAKOUT"
 
-        # Telegram alert
-
-        if signal=="STRONG BUY":
-            send_telegram(f"🚨 STRONG BUY ALERT {symbol}")
+        if signal == "STRONG BUY":
+            send_telegram(f"🚨 STRONG BUY ALERT: {symbol}")
 
         return {
-            "Symbol":symbol,
-            "Price":round(price,4),
-            "RSI":round(latest_rsi,2),
-            "Trend Score":trend_score,
-            "Momentum Score":momentum_score,
-            "Volume Surge %":volume_surge,
-            "Radar Score":round(radar_score,2),
-            "Signal":signal,
-            "Volatility %":round(volatility,2),
-            "Orderbook Imbalance %":imbalance,
-            "Breakout":breakout,
-            "Whale":whale
+            "Symbol": symbol,
+            "Price": round(price,4),
+            "RSI": round(latest_rsi,2),
+            "Trend": trend_score,
+            "Momentum": momentum_score,
+            "Volume Surge %": volume_surge,
+            "Radar Score": round(radar_score,2),
+            "Signal": signal,
+            "Volatility %": round(volatility,2),
+            "Orderbook Imbalance %": imbalance,
+            "Breakout": breakout,
+            "Whale": whale
         }
 
-    except:
+    except Exception:
+
         return None
 
+
 # -------------------------
-# PARALLEL SCAN
+# PARALLEL SCANNER
 # -------------------------
 
-results=[]
+results = []
 
 with ThreadPoolExecutor(max_workers=20) as executor:
-    data=list(executor.map(analyze_symbol,symbols))
+
+    data = list(executor.map(analyze_symbol, symbols))
 
 for d in data:
+
     if d:
+
         results.append(d)
 
-df=pd.DataFrame(results)
+df = pd.DataFrame(results)
+
 
 # -------------------------
-# RANKINGS
+# DASHBOARD DATA
 # -------------------------
 
-signals=df.sort_values(by="Radar Score",ascending=False).head(10)
+signals = df.sort_values(by="Radar Score", ascending=False).head(10)
 
-momentum=df.sort_values(by="Momentum Score",ascending=False).head(10)
+momentum = df.sort_values(by="Momentum", ascending=False).head(10)
 
-volume=df.sort_values(by="Volume Surge %",ascending=False).head(10)
+volume = df.sort_values(by="Volume Surge %", ascending=False).head(10)
 
-volatility=df.sort_values(by="Volatility %",ascending=False).head(10)
+volatility = df.sort_values(by="Volatility %", ascending=False).head(10)
 
-breakouts=df[df["Breakout"]=="BREAKOUT"]
+breakouts = df[df["Breakout"] == "BREAKOUT"]
 
-whales=df[df["Whale"]=="WHALE BUYING"]
+whales = df[df["Whale"] == "WHALE BUYING"]
 
-imbalance=df.sort_values(by="Orderbook Imbalance %",ascending=False).head(10)
+imbalance = df.sort_values(by="Orderbook Imbalance %", ascending=False).head(10)
+
 
 # -------------------------
-# DASHBOARD
+# DASHBOARD UI
 # -------------------------
 
-st.subheader("AI Trade Signals")
-st.dataframe(signals[["Symbol","Price","Radar Score","Signal"]])
+col1, col2 = st.columns(2)
 
-st.subheader("Momentum Radar")
-st.dataframe(momentum)
+with col1:
 
-st.subheader("Volume Surge")
-st.dataframe(volume)
+    st.subheader("AI Trade Signals")
 
-st.subheader("Volatility Radar")
-st.dataframe(volatility)
+    st.dataframe(signals[["Symbol","Price","Radar Score","Signal"]])
 
-st.subheader("Breakout Alerts")
-st.dataframe(breakouts)
+    st.subheader("Momentum Radar")
 
-st.subheader("Whale Activity")
-st.dataframe(whales)
+    st.dataframe(momentum)
+
+    st.subheader("Volume Surge")
+
+    st.dataframe(volume)
+
+with col2:
+
+    st.subheader("Volatility Radar")
+
+    st.dataframe(volatility)
+
+    st.subheader("Breakout Alerts")
+
+    st.dataframe(breakouts)
+
+    st.subheader("Whale Activity")
+
+    st.dataframe(whales)
 
 st.subheader("Orderbook Imbalance")
+
 st.dataframe(imbalance)
+
 
 # -------------------------
 # MARKET HEATMAP
@@ -228,9 +287,10 @@ st.dataframe(imbalance)
 
 st.subheader("Market Heatmap")
 
-heat=df[["Symbol","Radar Score"]].set_index("Symbol")
+heat = df[["Symbol","Radar Score"]].set_index("Symbol")
 
 st.bar_chart(heat)
+
 
 # -------------------------
 # TRADINGVIEW CHART
@@ -238,11 +298,11 @@ st.bar_chart(heat)
 
 st.subheader("Market Chart")
 
-selected=st.selectbox("Select Market",df["Symbol"])
+selected = st.selectbox("Select Market", df["Symbol"])
 
-tv="BINANCE:"+selected.replace("/","")
+tv_symbol = "BINANCE:" + selected.replace("/","")
 
-chart=f"""
+chart = f"""
 <div class="tradingview-widget-container">
 <div id="chart"></div>
 <script src="https://s3.tradingview.com/tv.js"></script>
@@ -250,7 +310,7 @@ chart=f"""
 new TradingView.widget({{
 "width":"100%",
 "height":500,
-"symbol":"{tv}",
+"symbol":"{tv_symbol}",
 "interval":"60",
 "theme":"dark",
 "container_id":"chart"
@@ -259,4 +319,4 @@ new TradingView.widget({{
 </div>
 """
 
-st.components.v1.html(chart,height=520)
+st.components.v1.html(chart, height=520)
